@@ -8,9 +8,9 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision                                  # ← import torchvision for make_grid
+import torchvision                                  
 from torchvision import datasets, transforms
-from torchvision.utils import make_grid             # ← import make_grid
+from torchvision.utils import make_grid             
 from torch.utils.data import DataLoader
 
 from sklearn.metrics import (
@@ -20,9 +20,7 @@ from sklearn.metrics import (
 
 import wandb
 
-# ──────────────────────────────────────────────────────────────────────────────
 # 1. SWEEP CONFIGURATION (Hyperparameter optimization)
-# ──────────────────────────────────────────────────────────────────────────────
 sweep_config = {
     'method': 'bayes',
     'metric': {'name': 'val_acc', 'goal': 'maximize'},
@@ -34,9 +32,7 @@ sweep_config = {
     }
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
 # 2. TRAINING FUNCTION (for each sweep trial)
-# ──────────────────────────────────────────────────────────────────────────────
 def train():
     # Init run (project inherited from sweep)
     wandb.init(tags=["demo", "full-featured"], notes="Full-featured MNIST demo")
@@ -140,7 +136,6 @@ def train():
             xs=fpr, ys=[tpr], keys=["class_0_tpr"], title="ROC curve (class 0)"
         )
 
-        # Log metrics + charts
         wandb.log({
             "epoch":           epoch,
             "train_loss":      t_loss/len(train_loader),
@@ -155,7 +150,6 @@ def train():
             "roc_curve":       roc_line
         })
 
-        # Checkpoint artifact
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             ckpt = f"ckpt_e{epoch}_acc{val_acc:.4f}.pt"
@@ -180,9 +174,8 @@ def train():
 
     wandb.finish()
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # 3. RUN THE SWEEP
-# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     sweep_id = wandb.sweep(sweep_config, project="mnist-full-demo")
     wandb.agent(sweep_id, function=train, count=20)

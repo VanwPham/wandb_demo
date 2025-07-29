@@ -1,163 +1,150 @@
-import comet_ml
-from comet_ml import Optimizer
-
-import os
-import time
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import os, time, numpy as np, pandas as pd
+from comet_ml import Optimizer, Experiment
+from comet_ml.integration.pytorch import watch
+import torch, torch.nn as nn, torch.optim as optim
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 from torch.utils.data import DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_curve
 
-WORKSPACE    = "vanwpham"        
-PROJECT_NAME = "mnist-comet-demo"
-
-sweep_parameters = {
-    "learning_rate": {"type": "float", "min": 1e-5, "max": 1e-1},
-    "momentum":      {"type": "float", "min": 0.5,  "max": 0.99},
-    "batch_size":    {"type": "categorical", "values": ["32", "64", "128"]},
-}
-
-sweep_config = {
+# ─── CONFIG
+WORKSPACE, PROJECT_NAME = "vanwpham", "mnist-comet-demo"
+SWEEP_CONFIG = {
     "algorithm": "bayes",
-    "parameters": sweep_parameters,
-    "spec": {
-        "metric": {"name": "val_accuracy", "goal": "maximize"},
-        "trials": 10
-    }
+    "parameters": {
+        "learning_rate": {"type": "float", "min": 1e-5, "max": 1e-1},
+        "momentum":      {"type": "float", "min": 0.5,  "max": 0.99},
+        "batch_size":    {"type": "categorical", "values": ["32", "64", "128"]},
+    },
+    "spec": {"metric": {"name": "val_accuracy", "goal": "maximize"},
+             "trials": 1,          # ≤ 8 completed; no bù nếu lỗi
+             "retryLimit": 0
+            }
 }
 
-optimizer = Optimizer(
-    api_key=os.getenv("COMET_API_KEY"),
-    workspace=WORKSPACE,
-    project_name=PROJECT_NAME,
-    config=sweep_config
-)
+T = transforms.Compose([transforms.ToTensor(),
+                        transforms.Normalize((0.1307,), (0.3081,))])
+TRAIN_DS = datasets.MNIST("data", train=True,  download=True, transform=T)
+TEST_DS  = datasets.MNIST("data", train=False, download=True, transform=T)
 
-def train_fn(experiment, params):
+TRAIN_COUNTS = pd.Series(TRAIN_DS.targets.numpy()).value_counts().sort_index()
+TEST_COUNTS  = pd.Series(TEST_DS.targets.numpy()).value_counts().sort_index()
+DATA_SUMMARY = pd.DataFrame({"label": range(10),
+                             "train_count": TRAIN_COUNTS.values,
+                             "test_count":  TEST_COUNTS.values})
+
+# GRID_IMG = make_grid(torch.stack([TRAIN_DS[i][0] for i in range(16)]),
+#                      nrow=4).permute(1, 2, 0).numpy()
+
+# ─── MODEL
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, 3, 1)
+        self.conv2 = nn.Conv2d(16, 32, 3, 1)
+        self.fc1   = nn.Linear(32*5*5, 128)
+        self.fc2   = nn.Linear(128, 10)
+    def forward(self, x):
+        x = nn.functional.relu(self.conv1(x))
+        x = nn.functional.max_pool2d(x, 2)
+        x = nn.functional.relu(self.conv2(x))
+        x = nn.functional.max_pool2d(x, 2)
+        x = x.flatten(1)
+        x = nn.functional.relu(self.fc1(x))
+        return self.fc2(x)
+
+# ─── TRAIN LOOP
+def train_fn(experiment: Experiment, params: dict):
+    bs = int(params["batch_size"]); lr = params["learning_rate"]; mom = params["momentum"]
+    experiment.set_name(f"lr={lr:.1e}_mom={mom:.2f}_bs={bs}")
+    experiment.add_tag("sweep-demo")
     experiment.log_parameters(params)
-    lr       = params["learning_rate"]
-    momentum = params["momentum"]
-    bs       = int(params["batch_size"])
-    epochs   = 5
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    train_ds = datasets.MNIST("data", train=True,  download=True, transform=transform)
-    test_ds  = datasets.MNIST("data", train=False, download=True, transform=transform)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model, opt = SimpleCNN().to(dev), optim.SGD(SimpleCNN().parameters(), lr=lr, momentum=mom)
+    crit = nn.CrossEntropyLoss(); watch(model)
 
-    train_counts = pd.Series(train_ds.targets.numpy()).value_counts().sort_index()
-    test_counts  = pd.Series(test_ds.targets.numpy()).value_counts().sort_index()
-    df_sum = pd.DataFrame({
-        "label":       range(10),
-        "train_count": train_counts.values,
-        "test_count":  test_counts.values
-    })
-    # FIX lỗi log_table và step bắt buộc của histogram
-    experiment.log_table("dataset_summary.csv", df_sum)
-    experiment.log_histogram_3d(train_counts.values, name="train_dist", step=0)
-    experiment.log_histogram_3d(test_counts.values,  name="test_dist", step=0)
+    TL = DataLoader(TRAIN_DS, batch_size=bs, shuffle=True)
+    VL = DataLoader(TEST_DS,  batch_size=bs, shuffle=False)
 
-    sample_imgs = torch.stack([train_ds[i][0] for i in range(16)])
-    grid = make_grid(sample_imgs, nrow=4)
-    grid_np = grid.permute(1,2,0).numpy()
-    experiment.log_image(grid_np, name="sample_images")
+    # dataset logs
+    experiment.log_table(filename="dataset_summary.csv", tabular_data=DATA_SUMMARY)
+    experiment.log_histogram_3d(TRAIN_COUNTS.values, name="train_dist", step=0)
+    experiment.log_histogram_3d(TEST_COUNTS.values,  name="test_dist",  step=0)
+    
+    # experiment.log_image(GRID_IMG, name="sample_images")
 
-    class SimpleCNN(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.conv1 = nn.Conv2d(1,16,3,1)
-            self.conv2 = nn.Conv2d(16,32,3,1)
-            self.fc1   = nn.Linear(32*5*5,128)
-            self.fc2   = nn.Linear(128,10)
-        def forward(self, x):
-            x = nn.functional.relu(self.conv1(x))
-            x = nn.functional.max_pool2d(x,2)
-            x = nn.functional.relu(self.conv2(x))
-            x = nn.functional.max_pool2d(x,2)
-            x = x.flatten(1)
-            x = nn.functional.relu(self.fc1(x))
-            return self.fc2(x)
+    tr_loss, va_loss, va_acc = [], [], []
+    best_acc, best_ckpt = 0, None
+    for epoch in range(1, 6):
+        # train
+        model.train(); s, c = 0.0, 0
+        for X, y in TL:
+            X, y = X.to(dev), y.to(dev); opt.zero_grad()
+            out = model(X); loss = crit(out, y); loss.backward(); opt.step()
+            s += loss.item(); c += (out.argmax(1) == y).sum().item()
+        tr_loss.append(s / len(TL)); train_acc = c / len(TL.dataset)
 
-    model     = SimpleCNN()
-    optimizer_model = optim.SGD(model.parameters(), lr=lr, momentum=momentum)
-    criterion = nn.CrossEntropyLoss()
-    experiment.watch(model, log_graph=True, log_weights=True, log_gradients=True)
-
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True)
-    test_loader  = DataLoader(test_ds,  batch_size=bs, shuffle=False)
-
-    best_val_acc = 0.0
-    ckpt = None
-
-    for epoch in range(1, epochs+1):
-        model.train()
-        loss_sum, correct = 0.0, 0
-        start = time.time()
-        for X, y in train_loader:
-            optimizer_model.zero_grad()
-            out = model(X)
-            loss = criterion(out, y)
-            loss.backward()
-            optimizer_model.step()
-            loss_sum += loss.item()
-            correct  += (out.argmax(1)==y).sum().item()
-        train_acc  = correct / len(train_loader.dataset)
-        train_time = time.time() - start
-
-        model.eval()
-        val_loss, val_correct = 0.0, 0
-        preds, trues = [], []
+        # val
+        model.eval(); s, c, pr, tr, p0 = 0.0, 0, [], [], []
         with torch.no_grad():
-            for X, y in test_loader:
-                out = model(X)
-                val_loss   += criterion(out, y).item()
-                p = out.argmax(1)
-                val_correct += (p==y).sum().item()
-                preds.extend(p.cpu().numpy())
-                trues.extend(y.cpu().numpy())
-        val_acc   = val_correct / len(test_loader.dataset)
-        precision = precision_score(trues, preds, average='macro')
-        recall    = recall_score(trues, preds, average='macro')
-        f1        = f1_score(trues, preds, average='macro')
+            for X, y in VL:
+                X, y = X.to(dev), y.to(dev); out = model(X)
+                s += crit(out, y).item(); p = out.argmax(1)
+                c += (p == y).sum().item()
+                pr.extend(p.cpu()); tr.extend(y.cpu())
+                p0.extend(torch.softmax(out,1)[:,0].cpu())
+        va_loss.append(s / len(VL)); v_acc = c / len(VL.dataset); va_acc.append(v_acc)
 
-        experiment.log_confusion_matrix(y_true=trues, y_pred=preds, step=epoch)
-        try:
-            fpr, tpr, _ = roc_curve([t==0 for t in trues], [p==0 for p in preds])
-            experiment.log_curve(fpr, tpr, name="roc_curve_class0", step=epoch)
-        except Exception:
-            pass
+        # logs
+        experiment.log_confusion_matrix(y_true=tr, y_predicted=pr, step=epoch)
+        fpr, tpr, _ = roc_curve(np.array(tr)==0, np.array(p0))
+        experiment.log_curve(name="ROC_class0", x=fpr, y=tpr, step=epoch)
+        experiment.log_metrics({"train_loss": tr_loss[-1], "train_acc": train_acc,
+                                "val_loss":   va_loss[-1], "val_acc": v_acc}, step=epoch)
 
-        experiment.log_metrics({
-            "train_loss": loss_sum/len(train_loader),
-            "train_acc":  train_acc,
-            "val_loss":   val_loss/len(test_loader),
-            "val_acc":    val_acc,
-            "precision":  precision,
-            "recall":     recall,
-            "f1_score":   f1,
-            "train_time": train_time
-        }, epoch=epoch, step=epoch)
+        if v_acc > best_acc:
+            best_acc, best_ckpt = v_acc, f"best_{experiment.get_key()}_e{epoch}.pth"
+            torch.save(model.state_dict(), best_ckpt)
+            experiment.log_model("best_checkpoint", best_ckpt)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            ckpt = f"best_{experiment.get_key()}_e{epoch}.pth"
-            torch.save(model.state_dict(), ckpt)
-            experiment.log_model("best_checkpoint", ckpt)
+    # — new: log curves instead of log_chart —
+    epochs = list(range(1, 6))
+    experiment.log_curve(name="train_loss_curve", x=epochs, y=tr_loss, step=5)
+    experiment.log_curve(name="val_loss_curve",   x=epochs, y=va_loss, step=5)
+    experiment.log_curve(name="val_acc_curve",    x=epochs, y=va_acc, step=5)
 
-    if ckpt:
-        experiment.log_model("final_model", ckpt)
-    report_md = f"# MNIST CometML Demo Report\n\nBest Val Accuracy: {best_val_acc:.4f}"
-    experiment.log_text(report_md, file_name="report.md")
+    # table HP + best score
+    hp_df = pd.DataFrame([{"batch_size": bs, "learning_rate": lr,
+                           "momentum": mom, "best_val_acc": best_acc}])
+    experiment.log_table(filename="hp_metrics.csv", tabular_data=hp_df)
+    experiment.log_metric("best_val_acc", best_acc, step=5)
+
+    experiment.log_text(text=f"# MNIST CometML Demo\n\nBest Val Acc: {best_acc:.4%}")
+    if best_ckpt: experiment.log_model("final_model", best_ckpt)
     experiment.end()
 
+def safe_train(experiment, params):
+    try:
+        train_fn(experiment, params)          # hàm huấn luyện gốc
+    except Exception as e:
+        experiment.log_other("exception", str(e))   # ghi lỗi để tra cứu
+        raise                                       # để hiện full trace
+    finally:
+        if experiment.alive:                       # đảm bảo kết thúc
+            experiment.end()
+
+# ─── SWEEP RUNNER
+
 if __name__ == "__main__":
-    for experiment in optimizer.get_experiments():
-        params = experiment.params
-        train_fn(experiment, params)
+    # Thay vì sweep
+    exp = Experiment(api_key=os.getenv("COMET_API_KEY"),
+                    workspace=WORKSPACE,
+                    project_name=PROJECT_NAME)
+    train_fn(exp, {"learning_rate": 1e-3, "momentum": 0.9, "batch_size": "64"})
+
+
+# if __name__ == "__main__":
+#     optzr = Optimizer(api_key=os.getenv("COMET_API_KEY"), config=SWEEP_CONFIG)
+#     for exp in optzr.get_experiments(workspace=WORKSPACE, project_name=PROJECT_NAME):
+#         safe_train(exp, exp.params)
