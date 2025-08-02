@@ -1,0 +1,17 @@
+method: bayes
+metric:
+  name: val_acc
+  goal: maximize
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-1
+  momentum:
+    distribution: uniform
+    min: 0.5
+    max: 0.99
+  batch_size:
+    values: [32, 64, 128]
+  epochs:
+    value: 5
